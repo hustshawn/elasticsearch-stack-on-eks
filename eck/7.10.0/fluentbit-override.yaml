@@ -1,0 +1,37 @@
+env:
+- name: QS_ES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: quickstart-es-elastic-user
+      key: elastic
+
+config:
+  outputs: |
+    [OUTPUT]
+        Name es
+        Match kube.*
+        Host quickstart-es-http.elastic-stack.svc
+        Port 9200
+        HTTP_User elastic
+        HTTP_Passwd ${QS_ES_PASSWORD}
+        tls On
+        tls.verify Off
+        Logstash_Format On
+        Suppress_Type_Name On
+        Retry_Limit False
+        Buffer_Size 64KB
+
+    [OUTPUT]
+        Name es
+        Match host.*
+        Host quickstart-es-http.elastic-stack.svc
+        Port 9200
+        HTTP_User elastic
+        HTTP_Passwd ${QS_ES_PASSWORD}
+        tls On
+        tls.verify Off
+        Logstash_Format On
+        Logstash_Prefix node
+        Suppress_Type_Name On
+        Retry_Limit False
+        Buffer_Size 64KB
