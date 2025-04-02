@@ -4,13 +4,15 @@ env:
     secretKeyRef:
       name: quickstart-es-elastic-user
       key: elastic
+- name: QS_ES_HOST
+  value: quickstart-es-http.elastic-stack.svc
 
 config:
   outputs: |
     [OUTPUT]
         Name es
         Match kube.*
-        Host quickstart-es-http.elastic-stack.svc
+        Host ${QS_ES_HOST}
         Port 9200
         HTTP_User elastic
         HTTP_Passwd ${QS_ES_PASSWORD}
@@ -24,7 +26,7 @@ config:
     [OUTPUT]
         Name es
         Match host.*
-        Host quickstart-es-http.elastic-stack.svc
+        Host ${QS_ES_HOST}
         Port 9200
         HTTP_User elastic
         HTTP_Passwd ${QS_ES_PASSWORD}

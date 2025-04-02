@@ -7,7 +7,7 @@ spec:
   version: 7.10.0
   nodeSets:
   - name: default
-    count: 1
+    count: 3
     config:
       node.store.allow_mmap: false
     podTemplate:
@@ -15,8 +15,17 @@ spec:
         labels:
           foo: bar
       spec:
+        initContainers:
+        - name: install-plugins
+          command:
+          - sh
+          - -c
+          - |
+            bin/elasticsearch-plugin remove --purge
+            bin/elasticsearch-plugin install --batch repository-s3
         containers:
         - name: elasticsearch
+          # You may update this acording to your usage
           resources:
             limits:
               memory: 4Gi
@@ -29,7 +38,7 @@ spec:
         - ReadWriteOnce
         resources:
           requests:
-            storage: 20Gi
+            storage: 20Gi # Modify this to your desired storage size
         # storageClassName: standard
 ---
 apiVersion: kibana.k8s.elastic.co/v1

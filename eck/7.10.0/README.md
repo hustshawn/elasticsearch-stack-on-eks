@@ -26,6 +26,10 @@ helm upgrade --install fluent-bit fluent/fluent-bit -f fluentbit-override.yaml
 
 Port forward the Kibana, acess the UI from `https://localhost:5601/`.
 
+```bash
+kubectl port-forward service/quickstart-kb-http 5601
+```
+
 The username is `elastic`, and password can be retrieved from the following command.
 
 ```bash
