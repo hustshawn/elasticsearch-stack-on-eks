@@ -3,11 +3,11 @@ kind: StorageClass
 metadata:
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
-  name: gp3
+  name: es-normal-storage
 parameters:
   type: gp3
-provisioner: ebs.csi.aws.com
-reclaimPolicy: Delete
+provisioner: ebs.csi.eks.amazonaws.com # for auto mode only
+reclaimPolicy: Retain
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
 ---
@@ -15,13 +15,13 @@ allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: gp3-high-iops
+  name: es-hot-storage
 parameters:
   type: gp3
   iops: "16000"
   throughput: "1000"
-provisioner: ebs.csi.aws.com
-reclaimPolicy: Delete
+provisioner: ebs.csi.eks.amazonaws.com # for auto mode only
+reclaimPolicy: Retain
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
 ---
@@ -92,7 +92,7 @@ spec:
         resources:
           requests:
             storage: 10Gi
-        storageClassName: gp3
+        storageClassName: es-normal-storage
   # Hot nodes for active data
   - name: hot
     count: 2
@@ -154,7 +154,7 @@ spec:
         resources:
           requests:
             storage: 500Gi
-        storageClassName: gp3-high-iops # Custom storage class for provisioned IOPS
+        storageClassName: es-hot-storage # Custom storage class for provisioned IOPS
   # Warm nodes for less frequently accessed data
   - name: warm
     count: 1
@@ -211,7 +211,7 @@ spec:
         resources:
           requests:
             storage: 500Gi
-        storageClassName: gp3 # Standard gp3 for warm nodes
+        storageClassName: es-normal-storage # Standard gp3 for warm nodes
   # Cold nodes for archival data
   - name: cold
     count: 1
@@ -267,8 +267,8 @@ spec:
         - ReadWriteOnce
         resources:
           requests:
-            storage: 900Gi
-        storageClassName: gp3 # Using standard gp3 for cold tier with more storage
+            storage: 800Gi
+        storageClassName: es-normal-storage # Using standard gp3 for cold tier with more storage
   # # Global cluster settings
   # secureSettings:
   # - secretName: s3-credentials
