@@ -1,0 +1,234 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-policies
+  namespace: elastic-stack
+data:
+  setup-policies.sh: |
+    #!/bin/bash
+
+    # Wait for Elasticsearch to be ready
+    until curl -s -k "https://quickstart-es-http:9200/" -u "elastic:${ELASTIC_PASSWORD}"; do
+      sleep 10
+    done
+
+    echo "Waiting for plugins to be installed..."
+    sleep 30
+
+    # Check if S3 repository type is available
+    echo "Checking if S3 repository plugin is available..."
+    RETRY_COUNT=0
+    MAX_RETRIES=10
+
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+      REPO_TYPES=$(curl -s -k "https://quickstart-es-http:9200/_nodes/plugins?pretty" -u "elastic:${ELASTIC_PASSWORD}")
+      if echo "$REPO_TYPES" | grep -q "repository-s3"; then
+        echo "S3 repository plugin found!"
+        break
+      else
+        echo "S3 repository plugin not found yet, waiting..."
+        sleep 15
+        RETRY_COUNT=$((RETRY_COUNT+1))
+      fi
+    done
+
+    if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+      echo "Warning: S3 repository plugin not found after maximum retries. Proceeding anyway..."
+    fi
+
+    # Create S3 repository
+    echo "Creating S3 repository..."
+    S3_REPO_RESPONSE=$(curl -X PUT -k "https://quickstart-es-http:9200/_snapshot/s3_repository" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+      "type": "s3",
+      "settings": {
+        "bucket": "${S3_BUCKET}",
+        "region": "${AWS_REGION}",
+        "compress": true,
+        "server_side_encryption": true
+      }
+    }')
+
+    # Check if S3 repository creation was successful
+    S3_REPO_AVAILABLE=false
+    if echo "$S3_REPO_RESPONSE" | grep -q "acknowledged.*true"; then
+      echo "S3 repository created successfully!"
+      S3_REPO_AVAILABLE=true
+    else
+      echo "Failed to create S3 repository: $S3_REPO_RESPONSE"
+      
+      # Create a fallback local repository
+      echo "Creating fallback local repository..."
+      curl -X PUT -k "https://quickstart-es-http:9200/_snapshot/local_backup" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+        "type": "fs",
+        "settings": {
+          "location": "/usr/share/elasticsearch/data/snapshots"
+        }
+      }'
+    fi
+
+    # Create ILM policy
+    echo "Creating ILM policy..."
+
+    # Base ILM policy - all phases except cold (will be added conditionally)
+    ILM_POLICY='{
+      "policy": {
+        "phases": {
+          "hot": {
+            "min_age": "0ms",
+            "actions": {
+              "rollover": {
+                "max_size": "50GB",
+                "max_age": "1d"
+              },
+              "set_priority": {
+                "priority": 100
+              }
+            }
+          },
+          "warm": {
+            "min_age": "7d",
+            "actions": {
+              "allocate": {
+                "require": {
+                  "data": "warm"
+                }
+              },
+              "set_priority": {
+                "priority": 50
+              }
+            }
+          },
+          "cold": {
+            "min_age": "15d",
+            "actions": {
+              "allocate": {
+                "require": {
+                  "data": "cold"
+                }
+              },
+              "set_priority": {
+                "priority": 25
+              },
+              "freeze": {}
+            }
+          },
+          "delete": {
+            "min_age": "90d",
+            "actions": {
+              "delete": {}
+            }
+          }
+        }
+      }
+    }'
+
+    # Add searchable_snapshot to cold phase if S3 repo is available
+    if [ "$S3_REPO_AVAILABLE" = true ]; then
+      echo "Adding searchable snapshot to cold phase in ILM policy"
+      # Use temporary file for jq processing
+      echo "$ILM_POLICY" > /tmp/ilm_policy.json
+      cat /tmp/ilm_policy.json | sed 's/"freeze": {}/&,\n              "searchable_snapshot": {\n                "snapshot_repository": "s3_repository"\n              }/' > /tmp/ilm_policy_with_snapshot.json
+      ILM_POLICY=$(cat /tmp/ilm_policy_with_snapshot.json)
+    fi
+
+    # Create the policy
+    curl -X PUT -k "https://quickstart-es-http:9200/_ilm/policy/logs-policy" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d "$ILM_POLICY"
+
+    # Create snapshot lifecycle policy
+    echo "Creating snapshot lifecycle policy..."
+
+    # Choose repository based on availability
+    REPO_NAME="local_backup"
+    if [ "$S3_REPO_AVAILABLE" = true ]; then
+      REPO_NAME="s3_repository"
+    fi
+
+    curl -X PUT -k "https://quickstart-es-http:9200/_slm/policy/daily-snapshots" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+      "schedule": "0 0 * * * ?",
+      "name": "<daily-snap-{now/d}>",
+      "repository": "'"$REPO_NAME"'",
+      "config": {
+        "indices": ["*"],
+        "ignore_unavailable": true,
+        "include_global_state": true
+      },
+      "retention": {
+        "expire_after": "30d",
+        "min_count": 5,
+        "max_count": 50
+      }
+    }'
+
+    echo "SLM policy created with repository: $REPO_NAME"
+
+    # Create index template for logs
+    curl -X PUT -k "https://quickstart-es-http:9200/_template/logs-template" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+      "index_patterns": ["logstash-*"],
+      "settings": {
+        "number_of_shards": 3,
+        "number_of_replicas": 1,
+        "index.lifecycle.name": "logs-policy",
+        "index.lifecycle.rollover_alias": "logs"
+      }
+    }'
+
+    # Apply lifecycle policy to existing indices
+    echo "Applying lifecycle policy to existing indices..."
+    for index in $(curl -s -k "https://quickstart-es-http:9200/logstash-*/_settings" -u "elastic:${ELASTIC_PASSWORD}" | grep -o '"logstash-[^"]*"' | tr -d '"'); do
+      echo "Applying logs-policy to $index"
+      curl -X PUT -k "https://quickstart-es-http:9200/$index/_settings" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+        "index.lifecycle.name": "logs-policy"
+      }'
+    done
+
+    # Create logs alias if it doesn't exist
+    echo "Creating logs alias for existing indices if needed..."
+    if ! curl -s -k "https://quickstart-es-http:9200/_alias/logs" -u "elastic:${ELASTIC_PASSWORD}" | grep -q "logs"; then
+      # Find the most recent logstash index to use as the write index
+      latest_index=$(curl -s -k "https://quickstart-es-http:9200/logstash-*" -u "elastic:${ELASTIC_PASSWORD}" | grep -o '"logstash-[^"]*"' | sort | tail -1 | tr -d '"')
+      if [ ! -z "$latest_index" ]; then
+        echo "Setting $latest_index as write index for logs alias"
+        curl -X POST -k "https://quickstart-es-http:9200/_aliases" -H 'Content-Type: application/json' -u "elastic:${ELASTIC_PASSWORD}" -d '{
+          "actions": [
+            {
+              "add": {
+                "index": "'"$latest_index"'",
+                "alias": "logs",
+                "is_write_index": true
+              }
+            }
+          ]
+        }'
+      fi
+    fi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: setup-elasticsearch-policies
+  namespace: elastic-stack
+spec:
+  template:
+    spec:
+      containers:
+      - name: setup
+        image: curlimages/curl:latest
+        command: [ "/bin/sh", "/scripts/setup-policies.sh" ]
+        env:
+        - name: ELASTIC_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: quickstart-es-elastic-user
+              key: elastic
+        - name: S3_BUCKET
+          value: eck-s3-demo-bucket-sdfghjklertyuio
+        - name: AWS_REGION
+          value: us-west-2
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: elasticsearch-policies
+      restartPolicy: OnFailure

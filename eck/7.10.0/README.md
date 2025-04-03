@@ -8,6 +8,18 @@ kubectl create -f https://download.elastic.co/downloads/eck/$VERSION/crds.yaml
 kubectl apply -f https://download.elastic.co/downloads/eck/$VERSION/operator.yaml
 ```
 
+## Configure the S3 access permission
+
+```bash
+eksctl create iamserviceaccount \
+  --name elasticsearch-s3 \
+  --namespace elastic-stack \
+  --cluster tf-eks-demo \
+  --attach-policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
+  --override-existing-serviceaccounts \
+  --approve
+```
+
 ## Install ECK
 
 ```bash
@@ -24,7 +36,7 @@ helm upgrade --install fluent-bit fluent/fluent-bit -f fluentbit-override.yaml
 
 ## Access Kibana
 
-Port forward the Kibana, acess the UI from `https://localhost:5601/`.
+Port forward the Kibana, acess the UI from `http://localhost:5601/`.
 
 ```bash
 kubectl port-forward service/quickstart-kb-http 5601

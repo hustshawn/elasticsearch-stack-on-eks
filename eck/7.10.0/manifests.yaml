@@ -1,3 +1,38 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  name: gp3
+parameters:
+  type: gp3
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-high-iops
+parameters:
+  type: gp3
+  iops: "16000"
+  throughput: "1000"
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elasticsearch-s3
+  namespace: elastic-stack
+  # annotations:
+  #   eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/elasticsearch-s3-role"
+---
 apiVersion: elasticsearch.k8s.elastic.co/v1
 kind: Elasticsearch
 metadata:
@@ -6,15 +41,27 @@ metadata:
 spec:
   version: 7.10.0
   nodeSets:
-  - name: default
+  # Dedicated master nodes for cluster coordination
+  - name: master
     count: 3
     config:
+      node.roles: [ "master" ]
       node.store.allow_mmap: false
+      cluster.remote.connect: false
+      path.repo: [ "/usr/share/elasticsearch/data/snapshots" ]
     podTemplate:
       metadata:
         labels:
-          foo: bar
+          elasticsearch.k8s.elastic.co/node-role: master
       spec:
+        serviceAccountName: elasticsearch-s3
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  elasticsearch.k8s.elastic.co/node-role: master
+              topologyKey: kubernetes.io/hostname
         initContainers:
         - name: install-plugins
           command:
@@ -23,23 +70,215 @@ spec:
           - |
             bin/elasticsearch-plugin remove --purge
             bin/elasticsearch-plugin install --batch repository-s3
+        - name: create-snapshot-dir
+          command:
+          - sh
+          - -c
+          - |
+            mkdir -p /usr/share/elasticsearch/data/snapshots
+            chmod 777 /usr/share/elasticsearch/data/snapshots
         containers:
         - name: elasticsearch
-          # You may update this acording to your usage
           resources:
             limits:
               memory: 4Gi
               cpu: 2
     volumeClaimTemplates:
     - metadata:
-        name: elasticsearch-data # Do not change this name unless you set up a volume mount for the data path.
+        name: elasticsearch-data
       spec:
         accessModes:
         - ReadWriteOnce
         resources:
           requests:
-            storage: 20Gi # Modify this to your desired storage size
-        # storageClassName: standard
+            storage: 10Gi
+        storageClassName: gp3
+  # Hot nodes for active data
+  - name: hot
+    count: 2
+    config:
+      node.roles: [ "data", "ingest" ]
+      node.store.allow_mmap: false
+      # Recommended settings for performance
+      indices.memory.index_buffer_size: 30%
+      indices.queries.cache.size: 20%
+      # S3 repository settings for IAM role
+      s3.client.default.protocol: https
+      s3.client.default.path_style_access: false
+      path.repo: [ "/usr/share/elasticsearch/data/snapshots" ]
+    podTemplate:
+      metadata:
+        labels:
+          elasticsearch.k8s.elastic.co/node-role: hot
+      spec:
+        serviceAccountName: elasticsearch-s3
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    elasticsearch.k8s.elastic.co/node-role: hot
+                topologyKey: kubernetes.io/hostname
+        initContainers:
+        - name: install-plugins
+          command:
+          - sh
+          - -c
+          - |
+            bin/elasticsearch-plugin remove --purge
+            bin/elasticsearch-plugin install --batch repository-s3
+        - name: create-snapshot-dir
+          command:
+          - sh
+          - -c
+          - |
+            mkdir -p /usr/share/elasticsearch/data/snapshots
+            chmod 777 /usr/share/elasticsearch/data/snapshots
+        containers:
+        - name: elasticsearch
+          resources:
+            limits:
+              memory: 16Gi
+              cpu: 4
+            requests:
+              memory: 16Gi
+              cpu: 4
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 500Gi
+        storageClassName: gp3-high-iops # Custom storage class for provisioned IOPS
+  # Warm nodes for less frequently accessed data
+  - name: warm
+    count: 1
+    config:
+      node.roles: [ "data" ] # Removed ingest role
+      node.attr.data: warm
+      node.store.allow_mmap: false
+      path.repo: [ "/usr/share/elasticsearch/data/snapshots" ]
+    podTemplate:
+      metadata:
+        labels:
+          elasticsearch.k8s.elastic.co/node-role: warm
+      spec:
+        serviceAccountName: elasticsearch-s3
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    elasticsearch.k8s.elastic.co/node-role: warm
+                topologyKey: kubernetes.io/hostname
+        initContainers:
+        - name: install-plugins
+          command:
+          - sh
+          - -c
+          - |
+            bin/elasticsearch-plugin remove --purge
+            bin/elasticsearch-plugin install --batch repository-s3
+        - name: create-snapshot-dir
+          command:
+          - sh
+          - -c
+          - |
+            mkdir -p /usr/share/elasticsearch/data/snapshots
+            chmod 777 /usr/share/elasticsearch/data/snapshots
+        containers:
+        - name: elasticsearch
+          resources:
+            limits:
+              memory: 8Gi
+              cpu: 2
+            requests:
+              memory: 8Gi
+              cpu: 2
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 500Gi
+        storageClassName: gp3 # Standard gp3 for warm nodes
+  # Cold nodes for archival data
+  - name: cold
+    count: 1
+    config:
+      node.roles: [ "data" ]
+      node.attr.data: cold
+      node.store.allow_mmap: false
+      path.repo: [ "/usr/share/elasticsearch/data/snapshots" ]
+    podTemplate:
+      metadata:
+        labels:
+          elasticsearch.k8s.elastic.co/node-role: cold
+      spec:
+        serviceAccountName: elasticsearch-s3
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    elasticsearch.k8s.elastic.co/node-role: cold
+                topologyKey: kubernetes.io/hostname
+        initContainers:
+        - name: install-plugins
+          command:
+          - sh
+          - -c
+          - |
+            bin/elasticsearch-plugin remove --purge
+            bin/elasticsearch-plugin install --batch repository-s3
+        - name: create-snapshot-dir
+          command:
+          - sh
+          - -c
+          - |
+            mkdir -p /usr/share/elasticsearch/data/snapshots
+            chmod 777 /usr/share/elasticsearch/data/snapshots
+        containers:
+        - name: elasticsearch
+          resources:
+            limits:
+              memory: 4Gi
+              cpu: 1
+            requests:
+              memory: 4Gi
+              cpu: 1
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 900Gi
+        storageClassName: gp3 # Using standard gp3 for cold tier with more storage
+  # # Global cluster settings
+  # secureSettings:
+  # - secretName: s3-credentials
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: false
+  updateStrategy:
+    changeBudget:
+      maxUnavailable: 1
 ---
 apiVersion: kibana.k8s.elastic.co/v1
 kind: Kibana
@@ -51,14 +290,30 @@ spec:
   count: 1
   elasticsearchRef:
     name: quickstart
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
   podTemplate:
     metadata:
       labels:
-        foo: bar
+        kibana.k8s.elastic.co/name: quickstart
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  kibana.k8s.elastic.co/name: quickstart
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: kibana
         resources:
           limits:
+            memory: 2Gi
+            cpu: 1
+          requests:
             memory: 1Gi
             cpu: 1

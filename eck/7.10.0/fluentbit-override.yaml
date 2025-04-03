@@ -19,6 +19,7 @@ config:
         tls On
         tls.verify Off
         Logstash_Format On
+        Logstash_Prefix kubernetes
         Suppress_Type_Name On
         Retry_Limit False
         Buffer_Size 64KB
